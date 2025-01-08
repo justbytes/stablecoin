@@ -4,6 +4,7 @@ pragma solidity ^0.8.16;
 import {DecentralizedStableCoin} from "./DecentralizedStableCoin.sol";
 import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {AggregatorV3Interface} from "@chainlink/contracts/src/v0.8/shared/interfaces/AggregatorV3Interface.sol";
 
 /// @title DSLEngine
 /// @author justbytes
@@ -18,7 +19,7 @@ contract DSLEngine is ReentrancyGuard {
     error DSLEngine__CollateralNotSupported();
     error DSLEngine__TokenAndPriceFeedLengthMismatch();
     error DSLEngine__TransferFailed();
-    error DSLEngine__HealthFactorIsBroken();
+    error DSLEngine__HealthFactorIsBroken(address user, uint256 healthFactor);
 
     /*//////////////////////////////////////////////////////////////
                                  STATE VARIABLES
@@ -28,10 +29,13 @@ contract DSLEngine is ReentrancyGuard {
     mapping(address user => mapping(address token => uint256 amount)) private s_collateralDeposited;
     mapping(address user => uint256 amountDSLMinted) private s_amountDSLMinted;
     address[] private s_collateralTokens;
-
+    uint256 private constant FEED_PRECISION = 1e10;
+    uint256 private constant LIQUIDATION_THRESHOLD = 50;
+    uint256 private constant MIN_HEALTH_FACTOR = 1;
     /*//////////////////////////////////////////////////////////////
                                  EVENTS
     //////////////////////////////////////////////////////////////*/
+
     event CollateralDeposited(address indexed user, address indexed token, uint256 indexed amount);
 
     /*//////////////////////////////////////////////////////////////
@@ -122,8 +126,9 @@ contract DSLEngine is ReentrancyGuard {
 
     function _revertIfHealthFactorIsBroken(address user) internal view {
         // Check for enough collateral
-        if (_healthFactor(user) < 1) {
-            revert DSLEngine__HealthFactorIsBroken();
+        uint256 healthFactor = _healthFactor(user);
+        if (healthFactor < MIN_HEALTH_FACTOR) {
+            revert DSLEngine__HealthFactorIsBroken(user, healthFactor);
         }
     }
 
@@ -134,7 +139,8 @@ contract DSLEngine is ReentrancyGuard {
      */
     function _healthFactor(address user) private view returns (uint256) {
         (uint256 totalDslMinted, uint256 collateralValueInUsd) = _getAccountInformation(user);
-        return totalDslMinted / collateralValueInUsd;
+        uint256 collateralValueInUsdWithThreshold = (collateralValueInUsd * LIQUIDATION_THRESHOLD) / 100; // Collateral value with threshold
+        return (collateralValueInUsdWithThreshold * 1e18) / totalDslMinted;
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -142,19 +148,19 @@ contract DSLEngine is ReentrancyGuard {
     //////////////////////////////////////////////////////////////*/
     function getHealthFactor() external view returns (uint256) {}
 
-    function getAccountCollateralValue(address user) public view returns (uint256) {
-        uint256 totalCollateralValue = 0;
+    function getAccountCollateralValue(address user) public view returns (uint256 totalCollateralValue) {
         for (uint256 i = 0; i < s_collateralTokens.length; i++) {
             address token = s_collateralTokens[i];
             uint256 amount = s_collateralDeposited[user][token];
-            uint256 price = getUsdValue(token, amount);
-            totalCollateralValue += price;
+            totalCollateralValue += getUsdValue(token, amount);
         }
         return totalCollateralValue;
     }
 
     function getUsdValue(address token, uint256 amount) public view returns (uint256) {
         // TODO Implement AggregatorV3Interface
-        return 0;
+        AggregatorV3Interface priceFeed = AggregatorV3Interface(s_priceFeeds[token]);
+        (, int256 answer,,,) = priceFeed.latestRoundData();
+        return ((uint256(answer) * uint256(10 ** priceFeed.decimals())) * amount) / 1e18;
     }
 }
