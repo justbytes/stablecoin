@@ -2,7 +2,7 @@ pragma solidity ^0.8.16;
 
 // Imports
 import {DecentralizedStableCoin} from "./DecentralizedStableCoin.sol";
-import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import {ReentrancyGuard} from "@openzeppelin/contracts/security/ReentrancyGuard.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {AggregatorV3Interface} from "@chainlink/contracts/src/v0.8/shared/interfaces/AggregatorV3Interface.sol";
 
@@ -20,27 +20,43 @@ contract DSLEngine is ReentrancyGuard {
     error DSLEngine__TokenAndPriceFeedLengthMismatch();
     error DSLEngine__TransferFailed();
     error DSLEngine__HealthFactorIsBroken(address user, uint256 healthFactor);
-
+    error DSLEngine__MintFailed();
+    error DSLEngine__RedeemCollateralTransferFailed();
+    error DSLEngine__BurnDSLTransferFromFailed();
+    error DSLEngine__HealthFactorIsNotBroken();
+    error DSLEngine__HealthFactorIsNotImproved();
     /*//////////////////////////////////////////////////////////////
                                  STATE VARIABLES
     //////////////////////////////////////////////////////////////*/
+
+    uint256 private constant FEED_PRECISION = 1e10;
+    uint256 private constant LIQUIDATION_THRESHOLD = 50;
+    uint256 private constant LIQUIDATION_PRECISION = 100;
+    uint256 private constant MIN_HEALTH_FACTOR = 1e18;
+    uint256 private constant PRECISION = 1e18;
+    uint256 private constant ADDITIONAL_FEED_PRECISION = 1e10;
+    uint256 private constant LIQUIDATION_BONUS = 10;
+
     DecentralizedStableCoin private immutable i_dsl;
+
     mapping(address token => address priceFeed) private s_priceFeeds;
     mapping(address user => mapping(address token => uint256 amount)) private s_collateralDeposited;
     mapping(address user => uint256 amountDSLMinted) private s_amountDSLMinted;
+
     address[] private s_collateralTokens;
-    uint256 private constant FEED_PRECISION = 1e10;
-    uint256 private constant LIQUIDATION_THRESHOLD = 50;
-    uint256 private constant MIN_HEALTH_FACTOR = 1;
+
     /*//////////////////////////////////////////////////////////////
                                  EVENTS
     //////////////////////////////////////////////////////////////*/
-
     event CollateralDeposited(address indexed user, address indexed token, uint256 indexed amount);
+    event CollateralRedeemed(
+        address indexed redeemedFrom, address indexed redeemedTo, address indexed token, uint256 amount
+    );
 
     /*//////////////////////////////////////////////////////////////
                                MODIFIERS
     //////////////////////////////////////////////////////////////*/
+
     modifier moreThanZero(uint256 _amount) {
         if (_amount == 0) {
             revert DSLEngine__ZeroAmountNotAllowed();
@@ -76,7 +92,10 @@ contract DSLEngine is ReentrancyGuard {
     /*//////////////////////////////////////////////////////////////
                            EXTERNAL & PUBLIC FUNCTIONS
     //////////////////////////////////////////////////////////////*/
-    function depositCollateralAndMintDSL(address tokenCollateralAddress, uint256 amountOfCollateral) external {}
+    function depositCollateralAndMintDSL(address tokenCollateralAddress, uint256 amountOfCollateral) external {
+        depositCollateral(tokenCollateralAddress, amountOfCollateral);
+        mintDSL(amountOfCollateral);
+    }
 
     /**
      * @notice Deposit collateral only if its is a supported token and the amount is more than 0
@@ -84,7 +103,7 @@ contract DSLEngine is ReentrancyGuard {
      * @param amountOfCollateral The amount of collateral to deposit
      */
     function depositCollateral(address tokenCollateralAddress, uint256 amountOfCollateral)
-        external
+        public
         moreThanZero(amountOfCollateral)
         isAllowedToken(tokenCollateralAddress)
         nonReentrant
@@ -97,23 +116,91 @@ contract DSLEngine is ReentrancyGuard {
         }
     }
 
-    function redeemCollateralForDSL() external {}
+    function redeemCollateralForDSL(
+        address tokenCollateralAddress,
+        uint256 amountOfCollateral,
+        uint256 amountOfDSLToBurn
+    ) external {
+        burnDSL(amountOfDSLToBurn);
+        _redeemCollateral(msg.sender, msg.sender, tokenCollateralAddress, amountOfCollateral);
+    }
 
-    function redeemCollateral() external {}
-
-    function mintDSL(uint256 amountToMint) external moreThanZero(amountToMint) nonReentrant {
-        s_amountDSLMinted[msg.sender] += amountToMint;
-
+    function redeemCollateral(address tokenCollateralAddress, uint256 amountOfCollateral)
+        external
+        moreThanZero(amountOfCollateral)
+        nonReentrant
+    {
+        _redeemCollateral(msg.sender, msg.sender, tokenCollateralAddress, amountOfCollateral);
         _revertIfHealthFactorIsBroken(msg.sender);
     }
 
-    function burnDSL() external {}
+    function mintDSL(uint256 amountToMint) public moreThanZero(amountToMint) nonReentrant {
+        s_amountDSLMinted[msg.sender] += amountToMint;
 
-    function liquidate() external {}
+        _revertIfHealthFactorIsBroken(msg.sender);
+
+        bool minted = i_dsl.mint(msg.sender, amountToMint);
+        if (!minted) {
+            revert DSLEngine__MintFailed();
+        }
+    }
+
+    function burnDSL(uint256 amount) public moreThanZero(amount) {
+        _burnDSL(amount, msg.sender, msg.sender);
+        _revertIfHealthFactorIsBroken(msg.sender); // May need to be removed
+    }
+
+    function liquidate(address collateralAddressToLiquidate, address userToBeLiquidated, uint256 debtToCover)
+        external
+        moreThanZero(debtToCover)
+        nonReentrant
+    {
+        uint256 startingUserHealthFactor = _healthFactor(userToBeLiquidated);
+
+        if (startingUserHealthFactor >= MIN_HEALTH_FACTOR) {
+            revert DSLEngine__HealthFactorIsNotBroken();
+        }
+
+        uint256 tokenAmountFromDebtCovered = getTokenAmountFromUsd(collateralAddressToLiquidate, debtToCover);
+        uint256 bonusCollateral = (tokenAmountFromDebtCovered * LIQUIDATION_BONUS) / LIQUIDATION_PRECISION;
+        uint256 totalCollateralToRedeem = tokenAmountFromDebtCovered + bonusCollateral;
+        _redeemCollateral(userToBeLiquidated, msg.sender, collateralAddressToLiquidate, totalCollateralToRedeem);
+
+        _burnDSL(debtToCover, userToBeLiquidated, msg.sender);
+
+        uint256 endingUserHealthFactor = _healthFactor(userToBeLiquidated);
+        if (endingUserHealthFactor <= startingUserHealthFactor) {
+            revert DSLEngine__HealthFactorIsNotImproved();
+        }
+        _revertIfHealthFactorIsBroken(msg.sender);
+    }
 
     /*//////////////////////////////////////////////////////////////
                     INTERNAL & PRIVATE FUNCTIONS
     //////////////////////////////////////////////////////////////*/
+
+    function _burnDSL(uint256 amountOfDSLToBurn, address onBehalfOf, address dslFrom) private {
+        s_amountDSLMinted[onBehalfOf] -= amountOfDSLToBurn;
+        bool success = i_dsl.transferFrom(dslFrom, address(this), amountOfDSLToBurn);
+        if (!success) {
+            revert DSLEngine__BurnDSLTransferFromFailed();
+        }
+        i_dsl.burn(amountOfDSLToBurn);
+    }
+
+    function _redeemCollateral(address from, address to, address tokenCollateralAddress, uint256 amountOfCollateral)
+        private
+        nonReentrant
+    {
+        s_collateralDeposited[from][tokenCollateralAddress] -= amountOfCollateral;
+        emit CollateralRedeemed(from, to, tokenCollateralAddress, amountOfCollateral);
+
+        bool success = IERC20(tokenCollateralAddress).transfer(to, amountOfCollateral);
+        if (!success) {
+            revert DSLEngine__RedeemCollateralTransferFailed();
+        }
+        _revertIfHealthFactorIsBroken(from);
+    }
 
     function _getAccountInformation(address user)
         internal
@@ -158,9 +245,22 @@ contract DSLEngine is ReentrancyGuard {
     }
 
     function getUsdValue(address token, uint256 amount) public view returns (uint256) {
-        // TODO Implement AggregatorV3Interface
         AggregatorV3Interface priceFeed = AggregatorV3Interface(s_priceFeeds[token]);
         (, int256 answer,,,) = priceFeed.latestRoundData();
-        return ((uint256(answer) * uint256(10 ** priceFeed.decimals())) * amount) / 1e18;
+        // 1 ETH = 1000 USD
+        // The returned value from Chainlink will be 1000 * 1e8
+        // Most USD pairs have 8 decimals, so we will just pretend they all do
+        // We want to have everything in terms of WEI, so we add 10 zeros at the end
+        return ((uint256(answer) * ADDITIONAL_FEED_PRECISION) * amount) / PRECISION;
+    }
+
+    function getTokenAmountFromUsd(address collateralAddressToLiquidate, uint256 usdAmountInWei)
+        public
+        view
+        returns (uint256)
+    {
+        AggregatorV3Interface priceFeed = AggregatorV3Interface(s_priceFeeds[collateralAddressToLiquidate]);
+        (, int256 answer,,,) = priceFeed.latestRoundData();
+        return (usdAmountInWei * PRECISION) / (uint256(answer) * ADDITIONAL_FEED_PRECISION);
     }
 }

@@ -22,7 +22,7 @@ contract DecentralizedStableCoin is ERC20Burnable, Ownable {
     address private immutable i_owner;
 
     // Constructor
-    constructor() ERC20("DefiStable", "DSL") Ownable(msg.sender) {
+    constructor() ERC20("DefiStable", "DSL") {
         i_owner = msg.sender;
     }
 
