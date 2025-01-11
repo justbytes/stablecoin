@@ -16,7 +16,7 @@ contract DSLEngine is ReentrancyGuard {
                                  ERRORS
     //////////////////////////////////////////////////////////////*/
     error DSLEngine__ZeroAmountNotAllowed();
-    error DSLEngine__CollateralNotSupported();
+    error DSLEngine__CollateralNotSupported(address tokenAddress);
     error DSLEngine__TokenAndPriceFeedLengthMismatch();
     error DSLEngine__TransferFailed();
     error DSLEngine__HealthFactorIsBroken(address user, uint256 healthFactor);
@@ -64,9 +64,9 @@ contract DSLEngine is ReentrancyGuard {
         _;
     }
 
-    modifier isAllowedToken(address _tokenAddress) {
-        if (s_priceFeeds[_tokenAddress] == address(0)) {
-            revert DSLEngine__CollateralNotSupported();
+    modifier isAllowedToken(address tokenAddress) {
+        if (s_priceFeeds[tokenAddress] == address(0)) {
+            revert DSLEngine__CollateralNotSupported(tokenAddress);
         }
         _;
     }
@@ -76,25 +76,29 @@ contract DSLEngine is ReentrancyGuard {
     //////////////////////////////////////////////////////////////*/
     /**
      */
-    constructor(address[] memory _tokenAddresses, address[] memory _priceFeedAddresses, address _dslAddress) {
-        if (_tokenAddresses.length != _priceFeedAddresses.length) {
+    constructor(address[] memory tokenAddresses, address[] memory priceFeedAddresses, address _dslAddress) {
+        if (tokenAddresses.length != priceFeedAddresses.length) {
             revert DSLEngine__TokenAndPriceFeedLengthMismatch();
         }
 
-        for (uint256 i = 0; i < _tokenAddresses.length; i++) {
-            s_priceFeeds[_tokenAddresses[i]] = _priceFeedAddresses[i];
-            s_collateralTokens.push(_tokenAddresses[i]);
+        for (uint256 i = 0; i < tokenAddresses.length; i++) {
+            s_priceFeeds[tokenAddresses[i]] = priceFeedAddresses[i];
+            s_collateralTokens.push(tokenAddresses[i]);
         }
 
         i_dsl = DecentralizedStableCoin(_dslAddress);
     }
 
     /*//////////////////////////////////////////////////////////////
-                           EXTERNAL & PUBLIC FUNCTIONS
+                           FUNCTIONS
     //////////////////////////////////////////////////////////////*/
-    function depositCollateralAndMintDSL(address tokenCollateralAddress, uint256 amountOfCollateral) external {
+    function depositCollateralAndMintDSL(
+        address tokenCollateralAddress,
+        uint256 amountOfCollateral,
+        uint256 amountOfDSLToMint
+    ) external {
         depositCollateral(tokenCollateralAddress, amountOfCollateral);
-        mintDSL(amountOfCollateral);
+        mintDSL(amountOfDSLToMint);
     }
 
     /**
@@ -135,12 +139,14 @@ contract DSLEngine is ReentrancyGuard {
     }
 
     function mintDSL(uint256 amountToMint) public moreThanZero(amountToMint) nonReentrant {
-        s_amountDSLMinted[msg.sender] += amountToMint;
+        uint256 previousAmountDSLMinted = s_amountDSLMinted[msg.sender];
+        s_amountDSLMinted[msg.sender] = previousAmountDSLMinted + amountToMint;
 
         _revertIfHealthFactorIsBroken(msg.sender);
 
         bool minted = i_dsl.mint(msg.sender, amountToMint);
         if (!minted) {
+            s_amountDSLMinted[msg.sender] = previousAmountDSLMinted;
             revert DSLEngine__MintFailed();
         }
     }
@@ -190,7 +196,6 @@ contract DSLEngine is ReentrancyGuard {
 
     function _redeemCollateral(address from, address to, address tokenCollateralAddress, uint256 amountOfCollateral)
         private
-        nonReentrant
     {
         s_collateralDeposited[from][tokenCollateralAddress] -= amountOfCollateral;
         emit CollateralRedeemed(from, to, tokenCollateralAddress, amountOfCollateral);
@@ -226,8 +231,7 @@ contract DSLEngine is ReentrancyGuard {
      */
     function _healthFactor(address user) private view returns (uint256) {
         (uint256 totalDslMinted, uint256 collateralValueInUsd) = _getAccountInformation(user);
-        uint256 collateralValueInUsdWithThreshold = (collateralValueInUsd * LIQUIDATION_THRESHOLD) / 100; // Collateral value with threshold
-        return (collateralValueInUsdWithThreshold * 1e18) / totalDslMinted;
+        return calculateHealthFactor(totalDslMinted, collateralValueInUsd);
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -262,5 +266,31 @@ contract DSLEngine is ReentrancyGuard {
         AggregatorV3Interface priceFeed = AggregatorV3Interface(s_priceFeeds[collateralAddressToLiquidate]);
         (, int256 answer,,,) = priceFeed.latestRoundData();
         return (usdAmountInWei * PRECISION) / (uint256(answer) * ADDITIONAL_FEED_PRECISION);
+    }
+
+    function getAccountInformation(address user)
+        external
+        view
+        returns (uint256 totalDslMinted, uint256 collateralValueInUsd)
+    {
+        (totalDslMinted, collateralValueInUsd) = _getAccountInformation(user);
+    }
+
+    function getCollateralTokens() external view returns (address[] memory) {
+        return s_collateralTokens;
+    }
+
+    function getCollateralBalanceOfUser(address user, address token) external view returns (uint256) {
+        return s_collateralDeposited[user][token];
+    }
+
+    function calculateHealthFactor(uint256 totalDslMinted, uint256 collateralValueInUsd)
+        public
+        pure
+        returns (uint256)
+    {
+        if (totalDslMinted == 0) return type(uint256).max;
+        uint256 collateralValueWithThreshold = (collateralValueInUsd * LIQUIDATION_THRESHOLD) / 100;
+        return (collateralValueWithThreshold * 1e18) / totalDslMinted;
     }
 }
