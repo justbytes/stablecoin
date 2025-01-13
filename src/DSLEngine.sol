@@ -127,6 +127,7 @@ contract DSLEngine is ReentrancyGuard {
     ) external {
         burnDSL(amountOfDSLToBurn);
         _redeemCollateral(msg.sender, msg.sender, tokenCollateralAddress, amountOfCollateral);
+        _revertIfHealthFactorIsBroken(msg.sender);
     }
 
     function redeemCollateral(address tokenCollateralAddress, uint256 amountOfCollateral)
@@ -204,7 +205,6 @@ contract DSLEngine is ReentrancyGuard {
         if (!success) {
             revert DSLEngine__RedeemCollateralTransferFailed();
         }
-        _revertIfHealthFactorIsBroken(from);
     }
 
     function _getAccountInformation(address user)
@@ -284,13 +284,21 @@ contract DSLEngine is ReentrancyGuard {
         return s_collateralDeposited[user][token];
     }
 
+    function getHealthFactor(address user) external view returns (uint256) {
+        return _healthFactor(user);
+    }
+
+    function getLiquidationBonus() external pure returns (uint256) {
+        return LIQUIDATION_BONUS;
+    }
+
     function calculateHealthFactor(uint256 totalDslMinted, uint256 collateralValueInUsd)
         public
         pure
         returns (uint256)
     {
         if (totalDslMinted == 0) return type(uint256).max;
-        uint256 collateralValueWithThreshold = (collateralValueInUsd * LIQUIDATION_THRESHOLD) / 100;
-        return (collateralValueWithThreshold * 1e18) / totalDslMinted;
+        uint256 collateralValueWithThreshold = (collateralValueInUsd * LIQUIDATION_THRESHOLD) / LIQUIDATION_PRECISION;
+        return (collateralValueWithThreshold * PRECISION) / totalDslMinted;
     }
 }
