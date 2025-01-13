@@ -18,13 +18,14 @@ contract DSLEngine is ReentrancyGuard {
     error DSLEngine__ZeroAmountNotAllowed();
     error DSLEngine__CollateralNotSupported(address tokenAddress);
     error DSLEngine__TokenAndPriceFeedLengthMismatch();
-    error DSLEngine__TransferFailed();
+    error DSLEngine__TransferFromFailed();
     error DSLEngine__HealthFactorIsBroken(address user, uint256 healthFactor);
     error DSLEngine__MintFailed();
     error DSLEngine__RedeemCollateralTransferFailed();
     error DSLEngine__BurnDSLTransferFromFailed();
     error DSLEngine__HealthFactorIsNotBroken();
     error DSLEngine__HealthFactorIsNotImproved();
+    error DSLEngine__BurnAmountIsGreaterThanUserBalance();
     /*//////////////////////////////////////////////////////////////
                                  STATE VARIABLES
     //////////////////////////////////////////////////////////////*/
@@ -116,7 +117,7 @@ contract DSLEngine is ReentrancyGuard {
         emit CollateralDeposited(msg.sender, tokenCollateralAddress, amountOfCollateral);
         bool success = IERC20(tokenCollateralAddress).transferFrom(msg.sender, address(this), amountOfCollateral);
         if (!success) {
-            revert DSLEngine__TransferFailed();
+            revert DSLEngine__TransferFromFailed();
         }
     }
 
@@ -157,6 +158,23 @@ contract DSLEngine is ReentrancyGuard {
         _revertIfHealthFactorIsBroken(msg.sender); // May need to be removed
     }
 
+    function _burnDSL(uint256 amountOfDSLToBurn, address onBehalfOf, address dslFrom) private {
+        // Check if user has enough DSL to burn first
+        if (amountOfDSLToBurn > s_amountDSLMinted[onBehalfOf]) {
+            revert DSLEngine__BurnAmountIsGreaterThanUserBalance();
+        }
+
+        // Only subtract after we've confirmed user has enough
+        s_amountDSLMinted[onBehalfOf] -= amountOfDSLToBurn;
+
+        // Burn the DSL
+        bool success = i_dsl.transferFrom(dslFrom, address(this), amountOfDSLToBurn);
+        if (!success) {
+            revert DSLEngine__BurnDSLTransferFromFailed();
+        }
+        i_dsl.burn(amountOfDSLToBurn);
+    }
+
     function liquidate(address collateralAddressToLiquidate, address userToBeLiquidated, uint256 debtToCover)
         external
         moreThanZero(debtToCover)
@@ -180,19 +198,6 @@ contract DSLEngine is ReentrancyGuard {
             revert DSLEngine__HealthFactorIsNotImproved();
         }
         _revertIfHealthFactorIsBroken(msg.sender);
-    }
-
-    /*//////////////////////////////////////////////////////////////
-                    INTERNAL & PRIVATE FUNCTIONS
-    //////////////////////////////////////////////////////////////*/
-
-    function _burnDSL(uint256 amountOfDSLToBurn, address onBehalfOf, address dslFrom) private {
-        s_amountDSLMinted[onBehalfOf] -= amountOfDSLToBurn;
-        bool success = i_dsl.transferFrom(dslFrom, address(this), amountOfDSLToBurn);
-        if (!success) {
-            revert DSLEngine__BurnDSLTransferFromFailed();
-        }
-        i_dsl.burn(amountOfDSLToBurn);
     }
 
     function _redeemCollateral(address from, address to, address tokenCollateralAddress, uint256 amountOfCollateral)
@@ -290,6 +295,26 @@ contract DSLEngine is ReentrancyGuard {
 
     function getLiquidationBonus() external pure returns (uint256) {
         return LIQUIDATION_BONUS;
+    }
+
+    function getCollateralTokenPriceFeed(address token) external view returns (address) {
+        return s_priceFeeds[token];
+    }
+
+    function getMinHealthFactor() external pure returns (uint256) {
+        return MIN_HEALTH_FACTOR;
+    }
+
+    function getLiquidationThreshold() external pure returns (uint256) {
+        return LIQUIDATION_THRESHOLD;
+    }
+
+    function getDsl() external view returns (address) {
+        return address(i_dsl);
+    }
+
+    function getLiquidationPrecision() external pure returns (uint256) {
+        return LIQUIDATION_PRECISION;
     }
 
     function calculateHealthFactor(uint256 totalDslMinted, uint256 collateralValueInUsd)

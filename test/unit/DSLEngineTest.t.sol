@@ -9,8 +9,14 @@ import {ERC20Mock} from "@openzeppelin/contracts/mocks/ERC20Mock.sol";
 import {MockV3Aggregator} from "../mocks/MockV3Aggregator.sol";
 import {MockMoreDebtDSL} from "../mocks/MockMoreDebtDSL.sol";
 import {MockFailedTransfer} from "../mocks/MockFailedTransfer.sol";
+import {MockFailedTransferFrom} from "../mocks/MockFailedTransferFrom.sol";
+import {MockFailedMintDSL} from "../mocks/MockFailedMintDSL.sol";
 
 contract DSLEngineTest is Test {
+    event CollateralRedeemed(
+        address indexed redeemedFrom, address indexed redeemedTo, address indexed token, uint256 amount
+    );
+
     DeployDSL public deployer;
     HelperConfig public config;
     DecentralizedStableCoin public dsl;
@@ -72,6 +78,28 @@ contract DSLEngineTest is Test {
     /*//////////////////////////////////////////////////////////////
                        DEPOSITE COLLATERAL TESTS
     //////////////////////////////////////////////////////////////*/
+    function testRevertsIfTransferFromFails() public {
+        // Arrange - Setup
+        address owner = msg.sender;
+        vm.prank(owner);
+        MockFailedTransferFrom mockDsl = new MockFailedTransferFrom();
+        tokenAddresses.push(address(mockDsl));
+        priceFeedAddresses.push(ethUsdPriceFeed);
+        vm.prank(owner);
+        DSLEngine mockDslEngine = new DSLEngine(tokenAddresses, priceFeedAddresses, address(mockDsl));
+        mockDsl.mint(USER, AMOUNT_OF_COLLATERAL);
+
+        vm.prank(owner);
+        mockDsl.transferOwnership(address(mockDslEngine));
+        // Arrange - User
+        vm.startPrank(USER);
+        ERC20Mock(address(mockDsl)).approve(address(mockDslEngine), AMOUNT_OF_COLLATERAL);
+        // Act / Assert
+        vm.expectRevert(DSLEngine.DSLEngine__TransferFromFailed.selector);
+        mockDslEngine.depositCollateral(address(mockDsl), AMOUNT_OF_COLLATERAL);
+        vm.stopPrank();
+    }
+
     function testRevertIfCollateralIsZero() public {
         vm.startPrank(USER);
         ERC20Mock(wethTokenAddress).approve(address(engine), AMOUNT_OF_COLLATERAL);
@@ -103,6 +131,11 @@ contract DSLEngineTest is Test {
         _;
     }
 
+    function testCanDepositCollateralWithoutMinting() public depositedCollateral {
+        uint256 userBalance = dsl.balanceOf(USER);
+        assertEq(userBalance, 0);
+    }
+
     function testCanDepositCollateralAndGetAccountInfo() public depositedCollateral {
         (uint256 totalDslMinted, uint256 collateralValueInUsd) = engine.getAccountInformation(USER);
         uint256 expectedDepositedCollateralAmount = engine.getTokenAmountFromUsd(wethTokenAddress, collateralValueInUsd);
@@ -110,9 +143,9 @@ contract DSLEngineTest is Test {
         assertEq(expectedDepositedCollateralAmount, AMOUNT_OF_COLLATERAL);
     }
 
-    ///////////////////////////////////////
-    // depositCollateralAndMintDsc Tests //
-    ///////////////////////////////////////
+    /*//////////////////////////////////////////////////////////////
+                    DEPOSIT COLLATERAL AND MINT DSL TESTS
+    //////////////////////////////////////////////////////////////*/
 
     function testRevertsIfMintedDslBreaksHealthFactor() public {
         (, int256 price,,,) = MockV3Aggregator(ethUsdPriceFeed).latestRoundData();
@@ -145,6 +178,24 @@ contract DSLEngineTest is Test {
     /*//////////////////////////////////////////////////////////////
                            MINT DSL TESTS
     //////////////////////////////////////////////////////////////*/
+    function testRevertsIfMintFails() public {
+        // Arrange - Setup
+        MockFailedMintDSL mockDsl = new MockFailedMintDSL();
+        tokenAddresses.push(wethTokenAddress);
+        priceFeedAddresses.push(ethUsdPriceFeed);
+        address owner = msg.sender;
+        vm.prank(owner);
+        DSLEngine mockDslEngine = new DSLEngine(tokenAddresses, priceFeedAddresses, address(mockDsl));
+        mockDsl.transferOwnership(address(mockDslEngine));
+        // Arrange - User
+        vm.startPrank(USER);
+        ERC20Mock(wethTokenAddress).approve(address(mockDslEngine), AMOUNT_OF_COLLATERAL);
+
+        vm.expectRevert(DSLEngine.DSLEngine__MintFailed.selector);
+        mockDslEngine.depositCollateralAndMintDSL(wethTokenAddress, AMOUNT_OF_COLLATERAL, amountToMint);
+        vm.stopPrank();
+    }
+
     function testRevertsIfMintAmountIsZero() public {
         vm.expectRevert(DSLEngine.DSLEngine__ZeroAmountNotAllowed.selector);
         engine.mintDSL(0);
@@ -155,37 +206,75 @@ contract DSLEngineTest is Test {
         (, int256 price,,,) = MockV3Aggregator(ethUsdPriceFeed).latestRoundData();
 
         // Calculate the amount that would break the health factor
-        uint256 amountToMint = (AMOUNT_OF_COLLATERAL * (uint256(price) * ADDITIONAL_FEED_PRECISION)) / PRECISION;
+        uint256 amount = (AMOUNT_OF_COLLATERAL * (uint256(price) * ADDITIONAL_FEED_PRECISION)) / PRECISION;
 
         vm.startPrank(USER);
         // Calculate expected health factor
         uint256 expectedHealthFactor =
-            engine.calculateHealthFactor(amountToMint, engine.getUsdValue(wethTokenAddress, AMOUNT_OF_COLLATERAL));
+            engine.calculateHealthFactor(amount, engine.getUsdValue(wethTokenAddress, AMOUNT_OF_COLLATERAL));
 
         // Expect revert with the calculated health factor
         vm.expectRevert(
             abi.encodeWithSelector(DSLEngine.DSLEngine__HealthFactorIsBroken.selector, USER, expectedHealthFactor)
         );
-        engine.mintDSL(amountToMint);
+        engine.mintDSL(amount);
         vm.stopPrank();
     }
 
     function testCanMintDSLWithSufficientCollateral() public depositedCollateral {
         uint256 collateralValueInUsd = engine.getUsdValue(wethTokenAddress, AMOUNT_OF_COLLATERAL);
-        uint256 amountToMint = collateralValueInUsd / 2; // Maintaining healthy collateral ratio
+        uint256 amount = collateralValueInUsd / 2; // Maintaining healthy collateral ratio
 
         vm.startPrank(USER);
-        engine.mintDSL(amountToMint);
+        engine.mintDSL(amount);
         vm.stopPrank();
 
         (uint256 totalDslMinted,) = engine.getAccountInformation(USER);
-        assertEq(totalDslMinted, amountToMint);
+        assertEq(totalDslMinted, amount);
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                               BURN TESTS
+    //////////////////////////////////////////////////////////////*/
+    function testRevertsIfBurnAmountIsZero() public {
+        vm.expectRevert(DSLEngine.DSLEngine__ZeroAmountNotAllowed.selector);
+        engine.burnDSL(0);
+    }
+
+    function testCantBurnMoreThanUserHas() public {
+        vm.startPrank(USER);
+        vm.expectRevert(DSLEngine.DSLEngine__BurnAmountIsGreaterThanUserBalance.selector);
+        engine.burnDSL(1e18);
+        vm.stopPrank();
+    }
+
+    function testCanBurnDSL() public depositedCollateralAndMintedDsl {
+        // Arrange
+        vm.startPrank(USER);
+        dsl.approve(address(engine), amountToMint);
+
+        // Get initial balances
+        uint256 initialDslBalance = dsl.balanceOf(USER);
+        (uint256 initialDslMinted,) = engine.getAccountInformation(USER);
+
+        // Act
+        engine.burnDSL(amountToMint);
+
+        // Assert
+        uint256 finalDslBalance = dsl.balanceOf(USER);
+        (uint256 finalDslMinted,) = engine.getAccountInformation(USER);
+
+        assertEq(finalDslBalance, initialDslBalance - amountToMint);
+        assertEq(finalDslMinted, initialDslMinted - amountToMint);
+        vm.stopPrank();
     }
 
     /*//////////////////////////////////////////////////////////////
                       REDEEM COLLATERAL TESTS
     //////////////////////////////////////////////////////////////*/
+
     // this test needs it's own setup
+
     function testRevertsIfTransferFails() public {
         // Arrange - Setup
         address owner = msg.sender;
@@ -223,6 +312,14 @@ contract DSLEngineTest is Test {
         engine.redeemCollateral(wethTokenAddress, AMOUNT_OF_COLLATERAL);
         uint256 userBalance = ERC20Mock(wethTokenAddress).balanceOf(USER);
         assertEq(userBalance, AMOUNT_OF_COLLATERAL);
+        vm.stopPrank();
+    }
+
+    function testEmitCollateralRedeemedWithCorrectArgs() public depositedCollateral {
+        vm.expectEmit(true, true, true, true, address(engine));
+        emit CollateralRedeemed(USER, USER, wethTokenAddress, AMOUNT_OF_COLLATERAL);
+        vm.startPrank(USER);
+        engine.redeemCollateral(wethTokenAddress, AMOUNT_OF_COLLATERAL);
         vm.stopPrank();
     }
 
@@ -378,14 +475,56 @@ contract DSLEngineTest is Test {
     /*//////////////////////////////////////////////////////////////
                            VIEW FUNCTION TESTS
     //////////////////////////////////////////////////////////////*/
+    function testGetCollateralTokenPriceFeed() public view {
+        address priceFeed = engine.getCollateralTokenPriceFeed(wethTokenAddress);
+        assertEq(priceFeed, ethUsdPriceFeed);
+    }
+
     function testGetCollateralTokens() public view {
         address[] memory collateralTokens = engine.getCollateralTokens();
         assertEq(collateralTokens[0], wethTokenAddress);
         assertEq(collateralTokens[1], wbtcTokenAddress);
     }
 
+    function testGetMinHealthFactor() public view {
+        uint256 minHealthFactor = engine.getMinHealthFactor();
+        assertEq(minHealthFactor, MIN_HEALTH_FACTOR);
+    }
+
+    function testGetLiquidationThreshold() public view {
+        uint256 liquidationThreshold = engine.getLiquidationThreshold();
+        assertEq(liquidationThreshold, LIQUIDATION_THRESHOLD);
+    }
+
+    function testGetAccountCollateralValueFromInformation() public depositedCollateral {
+        (, uint256 collateralValue) = engine.getAccountInformation(USER);
+        uint256 expectedCollateralValue = engine.getUsdValue(wethTokenAddress, AMOUNT_OF_COLLATERAL);
+        assertEq(collateralValue, expectedCollateralValue);
+    }
+
     function testGetCollateralBalanceOfUser() public depositedCollateral {
         uint256 collateralBalance = engine.getCollateralBalanceOfUser(USER, wethTokenAddress);
         assertEq(collateralBalance, AMOUNT_OF_COLLATERAL);
+    }
+
+    function testGetAccountCollateralValue() public {
+        vm.startPrank(USER);
+        ERC20Mock(wethTokenAddress).approve(address(engine), AMOUNT_OF_COLLATERAL);
+        engine.depositCollateral(wethTokenAddress, AMOUNT_OF_COLLATERAL);
+        vm.stopPrank();
+        uint256 collateralValue = engine.getAccountCollateralValue(USER);
+        uint256 expectedCollateralValue = engine.getUsdValue(wethTokenAddress, AMOUNT_OF_COLLATERAL);
+        assertEq(collateralValue, expectedCollateralValue);
+    }
+
+    function testGetDsl() public view {
+        address dslAddress = engine.getDsl();
+        assertEq(dslAddress, address(dsl));
+    }
+
+    function testLiquidationPrecision() public view {
+        uint256 expectedLiquidationPrecision = 100;
+        uint256 actualLiquidationPrecision = engine.getLiquidationPrecision();
+        assertEq(actualLiquidationPrecision, expectedLiquidationPrecision);
     }
 }
