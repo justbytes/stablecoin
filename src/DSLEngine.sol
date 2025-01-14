@@ -5,6 +5,7 @@ import {DecentralizedStableCoin} from "./DecentralizedStableCoin.sol";
 import {ReentrancyGuard} from "@openzeppelin/contracts/security/ReentrancyGuard.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {AggregatorV3Interface} from "@chainlink/contracts/src/v0.8/shared/interfaces/AggregatorV3Interface.sol";
+import {OracleLib} from "./library/OracleLib.sol";
 
 /// @title DSLEngine
 /// @author justbytes
@@ -26,6 +27,9 @@ contract DSLEngine is ReentrancyGuard {
     error DSLEngine__HealthFactorIsNotBroken();
     error DSLEngine__HealthFactorIsNotImproved();
     error DSLEngine__BurnAmountIsGreaterThanUserBalance();
+
+    // Types
+    using OracleLib for AggregatorV3Interface;
     /*//////////////////////////////////////////////////////////////
                                  STATE VARIABLES
     //////////////////////////////////////////////////////////////*/
@@ -239,6 +243,16 @@ contract DSLEngine is ReentrancyGuard {
         return calculateHealthFactor(totalDslMinted, collateralValueInUsd);
     }
 
+    function calculateHealthFactor(uint256 totalDslMinted, uint256 collateralValueInUsd)
+        public
+        pure
+        returns (uint256)
+    {
+        if (totalDslMinted == 0) return type(uint256).max;
+        uint256 collateralValueWithThreshold = (collateralValueInUsd * LIQUIDATION_THRESHOLD) / LIQUIDATION_PRECISION;
+        return (collateralValueWithThreshold * PRECISION) / totalDslMinted;
+    }
+
     /*//////////////////////////////////////////////////////////////
                    VIEW & PURE FUNCTIONS
     //////////////////////////////////////////////////////////////*/
@@ -256,11 +270,14 @@ contract DSLEngine is ReentrancyGuard {
     function getUsdValue(address token, uint256 amount) public view returns (uint256) {
         AggregatorV3Interface priceFeed = AggregatorV3Interface(s_priceFeeds[token]);
         (, int256 answer,,,) = priceFeed.latestRoundData();
-        // 1 ETH = 1000 USD
-        // The returned value from Chainlink will be 1000 * 1e8
-        // Most USD pairs have 8 decimals, so we will just pretend they all do
-        // We want to have everything in terms of WEI, so we add 10 zeros at the end
-        return ((uint256(answer) * ADDITIONAL_FEED_PRECISION) * amount) / PRECISION;
+        // Price feeds have 8 decimals, but we want everything in terms of WEI (18 decimals)
+        // ETH/USD price feed example: If ETH is $2000, answer will be 2000_00000000
+        // We multiply by 1e10 to get it to 1e18 precision
+        uint256 price = uint256(answer) * ADDITIONAL_FEED_PRECISION;
+        // amount is in WEI (18 decimals)
+        // price is now in 18 decimals
+        // We divide by PRECISION (1e18) to cancel out the extra precision
+        return (price * amount) / PRECISION;
     }
 
     function getTokenAmountFromUsd(address collateralAddressToLiquidate, uint256 usdAmountInWei)
@@ -269,7 +286,7 @@ contract DSLEngine is ReentrancyGuard {
         returns (uint256)
     {
         AggregatorV3Interface priceFeed = AggregatorV3Interface(s_priceFeeds[collateralAddressToLiquidate]);
-        (, int256 answer,,,) = priceFeed.latestRoundData();
+        (, int256 answer,,,) = OracleLib.staleCheckLatestRoundData(priceFeed);
         return (usdAmountInWei * PRECISION) / (uint256(answer) * ADDITIONAL_FEED_PRECISION);
     }
 
@@ -315,15 +332,5 @@ contract DSLEngine is ReentrancyGuard {
 
     function getLiquidationPrecision() external pure returns (uint256) {
         return LIQUIDATION_PRECISION;
-    }
-
-    function calculateHealthFactor(uint256 totalDslMinted, uint256 collateralValueInUsd)
-        public
-        pure
-        returns (uint256)
-    {
-        if (totalDslMinted == 0) return type(uint256).max;
-        uint256 collateralValueWithThreshold = (collateralValueInUsd * LIQUIDATION_THRESHOLD) / LIQUIDATION_PRECISION;
-        return (collateralValueWithThreshold * PRECISION) / totalDslMinted;
     }
 }
